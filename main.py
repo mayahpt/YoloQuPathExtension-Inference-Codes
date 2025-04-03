@@ -9,6 +9,7 @@ import cv2
 import geojson
 import numpy as np
 from ultralytics import YOLO
+from shapely.geometry import Polygon,MultiPolygon
 
 from utils import check_version, format_shapes, read_config
 
@@ -20,68 +21,19 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-
 def add_offsets(contour: list, offset_x: float, offset_y: float):
     """
     Add ROI offset values to coordinates.
-
-    Args:
-        contour (list): Found polygons and coordinates.
-        offset_x (float): Offset value in X-axis.
-        offset_y (float): Offset value in Y-axis.
-
-    Returns:
-        list: Offset added coordinates.
     """
-    np_contour = np.array(contour)
-    np_contour[:, 0] = np_contour[:, 0] + offset_x
-    np_contour[:, 1] = np_contour[:, 1] + offset_y
+    np_contour = np.array(contour,dtype=np.float64)
+
+    if np_contour.ndim != 2 or np_contour.shape[1] != 2:
+        logging.warning(f"Invalid contour shape: {np_contour.shape}, skipping offset.")
+        return []
+
+    np_contour[:, 0] += offset_x
+    np_contour[:, 1] += offset_y
     return np_contour.tolist()
-
-
-def mask_to_geojson(
-    mask: np.ndarray, output_path: str, args: argparse.Namespace, properties: dict
-):
-    """
-    Extract polygons from given mask and save to given output path.
-
-    Args:
-        mask (np.ndarray): Segmentation mask.
-        output_path (str): Output path.
-        args (argparse.Namespace): Parsed command-line arguments.
-        properties (dict): QuPath-specific geoJson properties.
-
-    Returns:
-        None
-    """
-    contours, hierarchy = cv2.findContours(
-        mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_TC89_KCOS
-    )
-    features = list()
-    for i, contour in enumerate(contours):
-        if hierarchy[0][i][3] == -1:
-            external = contour.squeeze().tolist()
-            if external[0] != external[-1]:
-                external.append(external[0])
-                external = add_offsets(external, args.roi_x, args.roi_y)
-            holes = []
-            if hierarchy[0][i][2] != -1:
-                child_idx = hierarchy[0][i][2]
-                while child_idx != -1:
-                    hole = contours[child_idx].squeeze().tolist()
-                    if hole[0] != hole[-1]:
-                        hole.append(hole[0])
-                        hole = add_offsets(hole, args.roi_x, args.roi_y)
-                    holes.append(hole)
-                    child_idx = hierarchy[0][child_idx][0]
-            geometry = geojson.Polygon([external] + holes)
-            feature = geojson.Feature(geometry=geometry, properties=properties)
-            features.append(feature)
-    feature_collection = geojson.FeatureCollection(features)
-    logging.info(f"Found {len(features)} objects.")
-    with open(output_path, "w") as f:
-        f.write(geojson.dumps(feature_collection, indent=2))
-
 
 def get_boundaries(tile_info: dict, args: argparse.Namespace, mask_shape: tuple):
     """
@@ -140,64 +92,46 @@ def extract_tile_info(tile_name: str):
     else:
         return None
 
-
-def clean_mask(mask: np.ndarray, operation: str, kernel_size: int):
+def xy_to_geojson(polygons: list, output_path: str, properties: dict):
     """
-    Apply a morphological operation to given mask.
-
-    Args:
-        mask (np.ndarray): The input mask.
-        operation (str): The type of morphological operation to apply.
-            Supported values: 'erosion', 'dilation', 'opening', 'closing'.
-        kernel_size (int): The size of the kernel used for morphological operations.
-
-    Raises:
-        ValueError: If the specified operation is not supported.
-
-    Returns:
-        np.ndarray: Morpohology applied mask.
+    Save vector polygons to GeoJSON format.
     """
-    kernel = np.ones((kernel_size, kernel_size), np.uint8)
-    if operation == "close":
-        cleaned_mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    elif operation == "open":
-        cleaned_mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    elif operation == "erode":
-        cleaned_mask = cv2.erode(mask, kernel)
-    elif operation == "dilate":
-        cleaned_mask = cv2.dilate(mask, kernel)
-    else:
-        raise ValueError("Operation should be either 'close' or 'open'")
-    return cleaned_mask
+    features = []
+    for coords in polygons:
+        if len(coords) < 3:
+            continue
 
+        if not (coords[0] == coords[-1]).all():
+            coords = np.vstack([coords, coords[0]])
+
+        polygon = Polygon(coords)
+        if not polygon.is_valid:
+            continue
+
+        features.append(geojson.Feature(geometry=polygon, properties=properties))
+
+    feature_collection = geojson.FeatureCollection(features)
+    logging.info(f"Exporting {len(features)} vector objects to GeoJSON.")
+    with open(output_path, "w") as f:
+        f.write(geojson.dumps(feature_collection, indent=2))
 
 def predict(config: dict, args: argparse.Namespace, operation: str, k_size: int):
     """
-    Get predictions on all tiles and reconstruct a mask for main ROI.
+    Run inference and return eroded, offset polygons using pred.masks.xy.
 
     Args:
-        config (dict): Dictionary containing configurations such as I/O paths.
-        args (argparse.Namespace): Parsed command-line arguments.
-        operation (str): Morphological operation to use.
-        kernel_size (int): The size of the kernel used for morphological operations.
+        config (dict): Paths and model config.
+        args (argparse.Namespace): Parsed CLI args with ROI and scaling.
+        operation (str): Unused.
+        k_size (int): Buffer size used for erosion.
 
     Returns:
-        np.ndarray: Reconstructed segmentation mask.
+        None
     """
-    full_shape = (int(args.roi_height), int(args.roi_width))
-    w = int(np.ceil(args.roi_width / args.ds))
-    h = int(np.ceil(args.roi_height / args.ds))
-    logging.info(f"ROI size: {format_shapes(full_shape)} -> {format_shapes((h, w))}")
-
-    main_mask = np.zeros((h, w), dtype=np.uint8)
+    logging.info("Vector-based prediction started.")
     model = YOLO(config["model_path"])
-    logging.info(
-        f"Model arguments - confidence: {args.conf}, iou: {args.iou}, imgsz: {args.imgsz}"
-    )
-    tile_count = len(os.listdir(config["roi_tiles_path"]))
-    logging.info(f"{tile_count} tiles found.")
+    logging.info(f"Model args - conf: {args.conf}, iou: {args.iou}, imgsz: {args.imgsz}")
 
-    infer_start = time.time()
     preds = model.predict(
         config["roi_tiles_path"],
         conf=args.conf,
@@ -206,42 +140,40 @@ def predict(config: dict, args: argparse.Namespace, operation: str, k_size: int)
         stream=True,
         verbose=False,
     )
-    logging.info(f"Inference completed in {time.time() - infer_start:.2f} seconds.")
+    logging.info("Inference done. Extracting polygons...")
 
-    logging.info("Arranging predictions to create full mask...")
-    mask_start = time.time()
-    empty_tile_list = list()
+    polygons = []
+    erosion_buffer = -k_size  # equivalent to your .buffer(-6)
+
     for pred in preds:
         tile_info = extract_tile_info(Path(pred.path).stem)
-        if tile_info is None:
-            logging.error("PROBLEM WITH ROI TILE NAMES!")
-            return
-
-        mask = pred.masks
-        if mask is not None:
-            merged_mask = np.any(mask.numpy().data, axis=0).astype(np.uint8)
-            empty_tile_list.append(True)
-        else:
-            empty_tile_list.append(False)
+        if tile_info is None or pred.masks is None or pred.masks.xy is None:
             continue
 
-        merged_mask = cv2.resize(
-            merged_mask, pred.orig_shape[::-1], interpolation=cv2.INTER_CUBIC
-        )
-        bound = get_boundaries(tile_info, args, merged_mask.shape)
-        main_mask[bound[0] : bound[1], bound[2] : bound[3]] |= merged_mask
-    logging.info(f"Full mask prepared in {time.time() - mask_start:.2f} seconds.")
+        for xy in pred.masks.xy:
+            if len(xy) < 3:
+                continue
 
-    if not np.any(empty_tile_list):
-        logging.warning("NO OBJECTS FOUND.")
-        return
+            # Scale + shift polygon to full image space
+            coords = xy * args.ds
+            coords[:,0] += tile_info["x"] #+ args.roi_x
+            coords[:,1] += tile_info["y"] #+ args.roi_y
+            polygon = Polygon(coords).buffer(erosion_buffer)
 
-    main_mask = clean_mask(main_mask, operation, k_size)
-    main_mask = cv2.resize(
-        main_mask, None, fx=args.ds, fy=args.ds, interpolation=cv2.INTER_CUBIC
-    )
-    return main_mask * 255
+            if polygon.is_empty:
+                continue
 
+            # Support MultiPolygons by splitting them up
+            if polygon.geom_type == 'MultiPolygon':
+                for geom in polygon.geoms:
+                    if geom.is_valid and not geom.is_empty:
+                        polygons.append(np.array(geom.exterior.coords))
+            elif polygon.geom_type == 'Polygon':
+                if polygon.is_valid:
+                    polygons.append(np.array(polygon.exterior.coords))
+
+    logging.info(f"Exporting {len(polygons)} eroded polygons to GeoJSON.")
+    xy_to_geojson(polygons, config["preds_path"], config["geojson_properties"])
 
 def load_arguments():
     """
@@ -262,25 +194,26 @@ def load_arguments():
     parser.add_argument("iou", type=float)
     args = parser.parse_args()
     return args
-
-
+    
 def main():
     if not check_version():
         logging.error("PYTHON VERSION SHOULD BE AT LEAST 3.8!")
         return
+
     logging.info("Process started.")
     start_time = time.time()
+
     args = load_arguments()
     config_path = args.base_path / "config.json"
     config = read_config(config_path, args.base_path, logging.getLogger(__name__))
-    mask = predict(
+
+    predict(
         config,
         args,
         config["morphology"]["operation"],
         config["morphology"]["kernel_size"],
     )
-    if mask is not None:
-        mask_to_geojson(mask, config["preds_path"], args, config["geojson_properties"])
+
     logging.info(f"Process finished in {time.time() - start_time:.2f} seconds.")
 
 

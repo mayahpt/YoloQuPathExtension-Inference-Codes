@@ -172,7 +172,6 @@ def predict(config: dict, args: argparse.Namespace, operation: str, k_size: int)
                 if polygon.is_valid:
                     polygons.append(np.array(polygon.exterior.coords))
 
-    logging.info(f"Exporting {len(polygons)} eroded polygons to GeoJSON.")
     xy_to_geojson(polygons, config["preds_path"], config["geojson_properties"])
 
 def load_arguments():
